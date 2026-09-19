@@ -13,7 +13,6 @@ use_debug_fission = true
 enable_nacl = false
 use_remoteexec = false
 use_siso = false
-use_clang_modules = false
 use_thin_lto = false
 treat_warnings_as_errors = false
 
