@@ -1,0 +1,21 @@
+# Optimized Chromium 136 build with complete DWARF debug information.
+# Split DWARF keeps the final link within a standard GitHub runner's memory.
+is_debug = false
+is_component_build = false
+is_official_build = false
+is_chrome_for_testing = false
+
+symbol_level = 2
+blink_symbol_level = 2
+v8_symbol_level = 2
+use_debug_fission = true
+
+enable_nacl = false
+use_remoteexec = false
+use_siso = false
+use_clang_modules = false
+use_thin_lto = false
+treat_warnings_as_errors = false
+
+# Persist compilation work between the time-boxed free-runner jobs.
+cc_wrapper = "sccache"

@@ -1,0 +1,226 @@
+name: build-chrome-headless-shell-136-unstripped
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_build_minutes:
+        description: Stop compilation early enough to save the sccache
+        default: "240"
+        required: true
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: chrome-headless-shell-136-unstripped
+  cancel-in-progress: false
+
+env:
+  CHROMIUM_VERSION: 136.0.7103.94
+  CHROMIUM_COMMIT: fa0be0b33debeb378a8e6ad9c599be34e2dc3b37
+  OFFICIAL_CFT_BUILD_ID: b7f06e222a7203cb9da1ba646660536a5096ee0d
+  CACHE_VERSION: v1
+  DEPOT_TOOLS: /mnt/work/depot_tools
+  SRC: /mnt/work/chromium/src
+  SCCACHE_VERSION: v0.16.0
+  SCCACHE_DIR: /mnt/work/sccache
+  SCCACHE_CACHE_SIZE: 9G
+  OUT: out/FullSymbols
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check whether the release already exists
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${CHROMIUM_VERSION}-unstripped" >/dev/null 2>&1; then
+            echo "done=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Release already exists; scheduled build is complete."
+          else
+            echo "done=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Reclaim runner disk
+        if: steps.release.outputs.done != 'true'
+        run: |
+          bash scripts/reclaim-disk.sh
+          sudo mkdir -p /mnt/work
+          sudo chown "$USER:$USER" /mnt/work
+          mkdir -p "$SCCACHE_DIR"
+
+      - name: Restore compilation cache
+        if: steps.release.outputs.done != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: /mnt/work/sccache
+          key: chromium-${{ env.CHROMIUM_VERSION }}-symbols-${{ env.CACHE_VERSION }}-${{ github.run_id }}
+          restore-keys: |
+            chromium-${{ env.CHROMIUM_VERSION }}-symbols-${{ env.CACHE_VERSION }}-
+
+      - name: Install sccache
+        if: steps.release.outputs.done != 'true'
+        run: |
+          curl --fail --location --silent --show-error \
+            "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            | sudo tar -xz --strip-components=1 -C /usr/local/bin \
+                "sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache"
+          sccache --version
+
+      - name: Fetch depot_tools
+        if: steps.release.outputs.done != 'true'
+        run: |
+          git clone --depth=1 \
+            https://chromium.googlesource.com/chromium/tools/depot_tools.git \
+            "$DEPOT_TOOLS"
+          echo "$DEPOT_TOOLS" >> "$GITHUB_PATH"
+
+      - name: Sync exact Chromium source and dependencies
+        if: steps.release.outputs.done != 'true'
+        run: |
+          export PATH="$DEPOT_TOOLS:$PATH"
+          mkdir -p /mnt/work/chromium
+          cd /mnt/work/chromium
+          gclient config --name src \
+            https://chromium.googlesource.com/chromium/src.git
+          gclient sync --no-history --nohooks --delete_unversioned_trees \
+            --revision "src@${CHROMIUM_COMMIT}"
+          test "$(git -C "$SRC" rev-parse HEAD)" = "$CHROMIUM_COMMIT"
+
+      - name: Install Linux build dependencies and run hooks
+        if: steps.release.outputs.done != 'true'
+        working-directory: ${{ env.SRC }}
+        run: |
+          export PATH="$DEPOT_TOOLS:$PATH"
+          sudo ./build/install-build-deps.sh --no-prompt --no-chromeos-fonts
+          gclient runhooks
+
+      - name: Generate full-symbol build
+        if: steps.release.outputs.done != 'true'
+        working-directory: ${{ env.SRC }}
+        run: |
+          export PATH="$DEPOT_TOOLS:$PATH"
+          mkdir -p "$OUT"
+          cp "$GITHUB_WORKSPACE/config/args.gn" "$OUT/args.gn"
+          gn gen "$OUT" --fail-on-unused-args
+          gn args "$OUT" --list --short | grep -E \
+            '^(is_debug|is_component_build|symbol_level|blink_symbol_level|v8_symbol_level|use_debug_fission) ='
+
+      - name: Build headless_shell (time boxed)
+        if: steps.release.outputs.done != 'true'
+        working-directory: ${{ env.SRC }}
+        run: |
+          export PATH="$DEPOT_TOOLS:$PATH"
+          sccache --start-server || true
+          minutes="${{ github.event.inputs.max_build_minutes || '240' }}"
+          set +e
+          timeout --kill-after=60s "${minutes}m" \
+            autoninja -C "$OUT" headless_shell
+          status=$?
+          set -e
+          sccache --show-stats || true
+          echo "build_status=$status" >> "$GITHUB_ENV"
+          if [[ $status -eq 124 ]]; then
+            echo "::notice::Time box reached; the next scheduled run will reuse sccache."
+          elif [[ $status -ne 0 ]]; then
+            echo "::error::Build failed with exit status $status."
+            exit "$status"
+          fi
+
+      - name: Stop compilers before saving cache
+        if: always() && steps.release.outputs.done != 'true'
+        run: |
+          pkill -TERM -f '(^|/)(autoninja|ninja|clang|clang\+\+)( |$)' || true
+          sleep 10
+          pkill -KILL -f '(^|/)(autoninja|ninja|clang|clang\+\+)( |$)' || true
+          sccache --stop-server || true
+
+      - name: Save compilation cache
+        if: always() && steps.release.outputs.done != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /mnt/work/sccache
+          key: chromium-${{ env.CHROMIUM_VERSION }}-symbols-${{ env.CACHE_VERSION }}-${{ github.run_id }}
+
+      - name: Assemble runtime and full DWARF package
+        if: env.build_status == '0'
+        working-directory: ${{ env.SRC }}
+        run: |
+          set -euo pipefail
+          product="$PWD/$OUT"
+          stage="$GITHUB_WORKSPACE/stage"
+          mkdir -p "$stage/runtime" "$stage/symbols"
+
+          cp "$product/headless_shell" "$stage/runtime/chrome-headless-shell"
+          for name in \
+            icudtl.dat headless_lib_data.pak headless_lib_strings.pak \
+            v8_context_snapshot.bin snapshot_blob.bin \
+            libEGL.so libGLESv2.so libvk_swiftshader.so libvulkan.so.1 \
+            vk_swiftshader_icd.json LICENSE.headless_shell; do
+            [[ ! -f "$product/$name" ]] || cp "$product/$name" "$stage/runtime/"
+          done
+
+          dwp="$SRC/third_party/llvm-build/Release+Asserts/bin/llvm-dwp"
+          "$dwp" -e "$product/headless_shell" \
+            -o "$stage/symbols/chrome-headless-shell.dwp"
+          cp "$product/headless_shell" \
+            "$stage/symbols/chrome-headless-shell"
+
+          version_output="$($stage/runtime/chrome-headless-shell --version)"
+          build_id="$(readelf -n "$stage/runtime/chrome-headless-shell" \
+            | sed -n 's/.*Build ID: //p' | head -n1)"
+          symtab_count="$(readelf --symbols --wide \
+            "$stage/runtime/chrome-headless-shell" | wc -l)"
+          debug_size="$(stat -c %s \
+            "$stage/symbols/chrome-headless-shell.dwp")"
+
+          test -n "$build_id"
+          test "$build_id" != "$OFFICIAL_CFT_BUILD_ID"
+          test "$symtab_count" -gt 1000
+          test "$debug_size" -gt 1000000
+
+          cat > "$stage/BUILD-METADATA.txt" <<EOF
+          Chromium version: $CHROMIUM_VERSION
+          Chromium commit: $CHROMIUM_COMMIT
+          Version output: $version_output
+          Rebuilt ELF Build ID: $build_id
+          Official stripped CfT Build ID (reference only): $OFFICIAL_CFT_BUILD_ID
+          symbol_level: 2
+          blink_symbol_level: 2
+          v8_symbol_level: 2
+          use_debug_fission: true
+          ELF symbol-table readelf line count: $symtab_count
+          DWP size in bytes: $debug_size
+          EOF
+
+          tar --zstd -cf \
+            "$GITHUB_WORKSPACE/chrome-headless-shell-${CHROMIUM_VERSION}-linux64-runtime.tar.zst" \
+            -C "$stage" runtime BUILD-METADATA.txt
+          tar --zstd -cf "$GITHUB_WORKSPACE/full-symbols.tar.zst" \
+            -C "$stage" symbols BUILD-METADATA.txt
+          split -b 1900M -d -a 3 \
+            "$GITHUB_WORKSPACE/full-symbols.tar.zst" \
+            "$GITHUB_WORKSPACE/chrome-headless-shell-${CHROMIUM_VERSION}-linux64-full-symbols.tar.zst.part-"
+          rm "$GITHUB_WORKSPACE/full-symbols.tar.zst"
+          cd "$GITHUB_WORKSPACE"
+          sha256sum chrome-headless-shell-*.tar.zst* > SHA256SUMS
+
+      - name: Publish GitHub release
+        if: env.build_status == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: ${{ github.workspace }}
+        run: |
+          tag="v${CHROMIUM_VERSION}-unstripped"
+          gh release create "$tag" \
+            chrome-headless-shell-*.tar.zst* SHA256SUMS stage/BUILD-METADATA.txt \
+            --title "chrome-headless-shell ${CHROMIUM_VERSION} unstripped" \
+            --notes "Optimized Linux x64 source build with symbol_level=2. Reassemble symbols with: cat *full-symbols.tar.zst.part-* > full-symbols.tar.zst"
